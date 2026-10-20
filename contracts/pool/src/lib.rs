@@ -7956,6 +7956,36 @@ mod test {
         (client, admin, usdc_id, share_token)
     }
 
+    // #915: only the configured insurance contract may credit a payout into
+    // pool accounting. Any other caller must be rejected with no state change.
+    #[test]
+    fn test_insurance_payout_rejected_from_unconfigured_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, usdc, _share) = setup(&env);
+        let insurance = Address::generate(&env);
+        client.set_insurance_contract(&admin, &insurance);
+        let attacker = Address::generate(&env);
+        let before = client.get_token_totals(&usdc).pool_value;
+
+        let result = client.try_receive_insurance_payout(&attacker, &usdc, &1u64, &1_000i128);
+        assert_eq!(result, Err(Ok(PoolError::Unauthorized)));
+        assert_eq!(client.get_token_totals(&usdc).pool_value, before);
+    }
+
+    #[test]
+    fn test_insurance_payout_credits_pool_from_configured_contract() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, usdc, _share) = setup(&env);
+        let insurance = Address::generate(&env);
+        client.set_insurance_contract(&admin, &insurance);
+        let before = client.get_token_totals(&usdc).pool_value;
+
+        client.receive_insurance_payout(&insurance, &usdc, &1u64, &1_000i128);
+        assert_eq!(client.get_token_totals(&usdc).pool_value, before + 1_000);
+    }
+
     fn mint(env: &Env, token_id: &Address, to: &Address, amount: i128) {
         soroban_sdk::token::StellarAssetClient::new(env, token_id).mint(to, &amount);
     }
