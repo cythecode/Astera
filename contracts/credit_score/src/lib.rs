@@ -145,6 +145,10 @@ const ADMIN_CHANGE_TIMELOCK_SECS: u64 = 172_800; // 48 hours - #565
 const CURRENT_MIGRATION_VERSION: u32 = 2;
 pub const MAX_PAYMENT_HISTORY: u32 = 100;
 
+/// #917: number of score snapshots retained per SME. Oldest entries are
+/// evicted first, so the history always holds the most recent trajectory.
+pub const MAX_SCORE_HISTORY: u32 = 100;
+
 /// Max page size for list_all_sme_stats to prevent gas exhaustion.
 const MAX_SME_PAGE_SIZE: u32 = 100;
 
@@ -179,6 +183,16 @@ pub enum PaymentStatus {
     PaidOnTime,
     PaidLate,
     Defaulted,
+}
+
+/// #917: one point in an SME's score trajectory, written each time a payment
+/// or default recomputes the score.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScoreSnapshot {
+    pub score: u32,
+    pub invoice_id: u64,
+    pub recorded_at: u64,
 }
 
 #[contracttype]
@@ -537,6 +551,8 @@ pub enum DataKey {
     /// disputed-or-resolved attestation can never be served from a stale
     /// pre-change cache entry - see `dispute_attestation`/`resolve_attestation_dispute`.
     AttestationGeneration(Address),
+    /// #917: rolling, oldest-first window of `ScoreSnapshot`s per SME.
+    ScoreHistory(Address),
 }
 
 const EVT: Symbol = symbol_short!("credit");
@@ -1094,6 +1110,7 @@ impl CreditScoreContract {
         );
         credit_data.score_version = scoring_config.core.score_version;
         credit_data.last_updated = env.ledger().timestamp();
+        Self::append_score_snapshot(env, sme, invoice_id, credit_data.score);
 
         env.storage()
             .persistent()
@@ -1105,6 +1122,27 @@ impl CreditScoreContract {
         extend_credit_ttl(env, &DataKey::InvoiceProcessed(invoice_id));
 
         credit_data
+    }
+
+    /// #917: append the freshly computed score to the SME's bounded history,
+    /// evicting the oldest snapshot once `MAX_SCORE_HISTORY` is reached.
+    fn append_score_snapshot(env: &Env, sme: &Address, invoice_id: u64, score: u32) {
+        let key = DataKey::ScoreHistory(sme.clone());
+        let mut history: Vec<ScoreSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if history.len() >= MAX_SCORE_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(ScoreSnapshot {
+            score,
+            invoice_id,
+            recorded_at: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&key, &history);
+        extend_credit_ttl(env, &key);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1385,6 +1423,16 @@ impl CreditScoreContract {
             }
         }
         records
+    }
+
+    /// #917: the SME's retained score trajectory, oldest first. Lets lenders see
+    /// how the score moved without indexing `record_payment`/`record_default`
+    /// events. Holds at most `MAX_SCORE_HISTORY` of the most recent snapshots.
+    pub fn get_score_history(env: Env, sme: Address) -> Vec<ScoreSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ScoreHistory(sme))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn get_payment_record_score_version(env: Env, invoice_id: u64) -> Option<u32> {
@@ -3390,6 +3438,87 @@ mod test {
             result.unwrap_err().unwrap(),
             CreditScoreError::ContractPaused.into()
         );
+    }
+
+    // #916: a repeated record_default for the same invoice must be rejected and
+    // must not penalise the SME a second time.
+    #[test]
+    fn test_duplicate_default_does_not_double_penalize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 100_000);
+        let (client, _admin, _inv, pool) = setup(&env);
+        let sme = Address::generate(&env);
+        let due_date = 200_000u64;
+
+        client.record_default(&pool, &7, &sme, &1_000_000_000i128, &due_date);
+        let before = client.get_credit_score(&sme);
+
+        let result = client.try_record_default(&pool, &7, &sme, &1_000_000_000i128, &due_date);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            CreditScoreError::InvoiceAlreadyProcessed.into()
+        );
+
+        let after = client.get_credit_score(&sme);
+        assert_eq!(after.defaulted, 1);
+        assert_eq!(after.total_invoices, before.total_invoices);
+        assert_eq!(after.score, before.score);
+        assert_eq!(client.get_score_history(&sme).len(), 1);
+    }
+
+    // #917: every scoring event appends a snapshot that matches the score the
+    // contract reports afterwards.
+    #[test]
+    fn test_score_history_records_each_scoring_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 100_000);
+        let (client, _admin, _inv, pool) = setup(&env);
+        let sme = Address::generate(&env);
+        let due_date = 200_000u64;
+
+        assert_eq!(client.get_score_history(&sme).len(), 0);
+
+        client.record_payment(&pool, &1, &sme, &1_000_000_000i128, &due_date, &150_000u64);
+        client.record_default(&pool, &2, &sme, &1_000_000_000i128, &due_date);
+
+        let history = client.get_score_history(&sme);
+        assert_eq!(history.len(), 2);
+        let first = history.get(0).unwrap();
+        let last = history.get(1).unwrap();
+        assert_eq!(first.invoice_id, 1);
+        assert_eq!(last.invoice_id, 2);
+        assert_eq!(last.score, client.get_credit_score(&sme).score);
+    }
+
+    // #917: the history is a rolling window - it never grows past
+    // MAX_SCORE_HISTORY and evicts the oldest snapshots first.
+    #[test]
+    fn test_score_history_is_capped_and_keeps_newest() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 100_000);
+        let (client, _admin, _inv, pool) = setup(&env);
+        let sme = Address::generate(&env);
+        let due_date = 200_000u64;
+        let total: u64 = MAX_SCORE_HISTORY as u64 + 5;
+
+        for invoice_id in 1..=total {
+            client.record_payment(
+                &pool,
+                &invoice_id,
+                &sme,
+                &1_000_000_000i128,
+                &due_date,
+                &150_000u64,
+            );
+        }
+
+        let history = client.get_score_history(&sme);
+        assert_eq!(history.len(), MAX_SCORE_HISTORY);
+        assert_eq!(history.get(0).unwrap().invoice_id, 6);
+        assert_eq!(history.get(MAX_SCORE_HISTORY - 1).unwrap().invoice_id, total);
     }
 
     #[test]
